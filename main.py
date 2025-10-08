@@ -22,6 +22,7 @@ def random_user_agent():
     ]
     return random.choice(agents)
 
+
 # -------------------- AnimePahe Class --------------------
 class AnimePahe:
     def __init__(self):
@@ -87,14 +88,24 @@ class AnimePahe:
     async def get_sources(self, anime_session: str, episode_session: str):
         url = f"{self.base}/play/{anime_session}/{episode_session}"
         html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
+
+        # Extract all data-src URLs
         matches = re.findall(r'data-src="([^"]+)"', html)
-        unique = list(dict.fromkeys(matches))  # remove duplicates while preserving order
-        if not unique:
-            kwik_links = re.findall(r"https:\/\/kwik\.si\/e\/\w+", html)
-            unique = kwik_links
-        if not unique:
-            raise Exception("No source links found on play page")
-        return unique
+
+        # Filter only kwik links (supporting future mirror domains)
+        kwik_links = [m for m in matches if re.match(r"https:\/\/kwik\.(si|cx|link)\/e\/", m)]
+
+        # Fallback (in case not found via data-src)
+        if not kwik_links:
+            kwik_links = re.findall(r"https:\/\/kwik\.(si|cx|link)\/e\/\w+", html)
+
+        # Remove duplicates while keeping order
+        unique_kwik = list(dict.fromkeys(kwik_links))
+
+        if not unique_kwik:
+            raise Exception("No kwik links found on play page")
+
+        return unique_kwik
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
         html = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20).text)
@@ -175,9 +186,11 @@ class AnimePahe:
             return m_html.group(1)
         raise Exception(f"Could not resolve .m3u8. Node output (first 2000 chars):\n{out[:2000]}")
 
+
 # -------------------- FastAPI --------------------
 app = FastAPI()
 pahe = AnimePahe()
+
 
 @app.get("/search")
 async def api_search(q: str):
@@ -187,6 +200,7 @@ async def api_search(q: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/episodes")
 async def api_episodes(session: str):
     try:
@@ -195,6 +209,7 @@ async def api_episodes(session: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/sources")
 async def api_sources(anime_session: str, episode_session: str):
     try:
@@ -202,6 +217,7 @@ async def api_sources(anime_session: str, episode_session: str):
         return JSONResponse(content=srcs)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/m3u8")
 async def api_resolve_kwik(url: str):
