@@ -1,0 +1,13 @@
+# HTTP client
+httpx
+
+# Run JS 
+PyExecJS
+
+# HTML parsing
+beautifulsoup4
+
+# FastAPI + ASGI server to run it
+fastapi
+uvicorn
+
