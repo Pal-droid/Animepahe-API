@@ -22,7 +22,7 @@ This project provides an **async Python FastAPI backend** to search for anime, f
 1. **Clone the repository:**
 
 ```bash
-git clone https://github.com/yourusername/animepahe-api-scraper.git
+git clone https://github.com/pal-droid/animepahe-api-scraper.git
 cd animepahe-api-scraper
 ```
 
@@ -113,7 +113,7 @@ Output:
 ]
 ```
 
-
+---
 
 ```http
 GET /episodes?session=27a95751-0311-47ed-dbce-7f0680d5074a
@@ -140,7 +140,7 @@ Output:
 ]
 ```
 
-
+---
 
 ```http
 GET /sources?anime_session=27a95751-0311-47ed-dbce-7f0680d5074a&episode_session=800a1f7d29d6ebb94d2bfd320b2001b95d00decff4aaecaa6fbef5916379a762
@@ -171,7 +171,7 @@ Output:
 ]
 ```
 
-
+---
 
 ```http
 GET /m3u8?url=https://kwik.si/e/uEPQKLMzFpaz
