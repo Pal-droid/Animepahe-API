@@ -189,6 +189,5 @@ Output:
 
 ## Notes
 
-- `cloudscraper` handles basic Cloudflare IUAM pages. Some advanced protections may still fail.
 - `.m3u8` resolution can fall back to `execjs` if Node.js is unavailable.
 - Always respect the website's terms of service and do not abuse the API.
