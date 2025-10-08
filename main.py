@@ -1,5 +1,4 @@
 import asyncio
-import httpx
 import re
 import random
 import tempfile
@@ -9,6 +8,7 @@ from bs4 import BeautifulSoup
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+import cloudscraper
 
 # -------------------- Utility --------------------
 def random_user_agent():
@@ -31,13 +31,12 @@ class AnimePahe:
             "Cookie": "__ddg1_=;__ddg2_=",
             "Referer": "https://animepahe.si/",
         }
+        self.scraper = cloudscraper.create_scraper()
 
     async def search(self, query: str):
         url = f"{self.base}/api?m=search&q={query}"
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(url, headers=self.headers)
-            r.raise_for_status()
-            data = r.json()
+        html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
+        data = execjs.eval(f"JSON.parse(`{html}`)") if isinstance(html, str) else html
         results = []
         for a in data.get("data", []):
             results.append({
@@ -52,39 +51,28 @@ class AnimePahe:
         return results
 
     async def get_episodes(self, anime_session: str):
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(f"{self.base}/anime/{anime_session}", headers=self.headers)
-            r.raise_for_status()
-            html = r.text
+        html = await asyncio.to_thread(lambda: self.scraper.get(f"{self.base}/anime/{anime_session}", headers=self.headers).text)
         soup = BeautifulSoup(html, "html.parser")
         meta = soup.find("meta", {"property": "og:url"})
         if not meta:
             raise Exception("Could not find session ID in meta tag")
-        parts = meta["content"].split("/")
-        temp_id = parts[-1]
+        temp_id = meta["content"].split("/")[-1]
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(
-                f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1",
-                headers=self.headers,
-            )
-            r.raise_for_status()
-            first_page = r.json()
-        episodes = first_page.get("data", [])
-        last_page = first_page.get("last_page", 1)
+        first_page_json = await asyncio.to_thread(
+            lambda: self.scraper.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1", headers=self.headers).json()
+        )
+        episodes = first_page_json.get("data", [])
+        last_page = first_page_json.get("last_page", 1)
 
         async def fetch_page(p):
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                r = await client.get(
-                    f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}",
-                    headers=self.headers,
-                )
-                r.raise_for_status()
-                return r.json().get("data", [])
+            return await asyncio.to_thread(
+                lambda: self.scraper.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}", headers=self.headers).json().get("data", [])
+            )
 
         tasks = [fetch_page(p) for p in range(2, last_page + 1)]
         for pages in await asyncio.gather(*tasks):
             episodes.extend(pages)
+
         return [
             {
                 "id": e["id"],
@@ -98,15 +86,9 @@ class AnimePahe:
 
     async def get_sources(self, anime_session: str, episode_session: str):
         url = f"{self.base}/play/{anime_session}/{episode_session}"
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(url, headers=self.headers)
-            r.raise_for_status()
-            html = r.text
+        html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
         matches = re.findall(r'data-src="([^"]+)"', html)
-        unique = []
-        for m in matches:
-            if m not in unique:
-                unique.append(m)
+        unique = list(dict.fromkeys(matches))  # remove duplicates while preserving order
         if not unique:
             kwik_links = re.findall(r"https:\/\/kwik\.si\/e\/\w+", html)
             unique = kwik_links
@@ -115,18 +97,13 @@ class AnimePahe:
         return unique
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(kwik_url, headers=self.headers, timeout=20.0)
-            r.raise_for_status()
-            html = r.text
+        html = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20).text)
         m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
         if m3u8_direct:
             return m3u8_direct.group(0)
 
-        script_block = None
         scripts = re.findall(r"(<script[^>]*>[\s\S]*?</script>)", html, re.IGNORECASE)
-        largest_eval_script = None
-        max_len = 0
+        script_block, largest_eval_script, max_len = None, None, 0
         for s in scripts:
             if "eval(" in s:
                 if "source" in s or ".m3u8" in s or "Plyr" in s:
@@ -141,12 +118,11 @@ class AnimePahe:
             m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
             if m_html:
                 return m_html.group(1)
-            raise Exception("No candidate <script> block found to evaluate with Node/ExecJS")
+            raise Exception("No candidate <script> block found to evaluate")
 
         inner_js = re.sub(r"^<script[^>]*>", "", script_block, flags=re.IGNORECASE).strip()
         inner_js = re.sub(r"</script>$", "", inner_js, flags=re.IGNORECASE).strip()
-        transformed_node = inner_js
-        transformed_node = re.sub(r"\bdocument\b", "DOC_STUB", transformed_node)
+        transformed_node = re.sub(r"\bdocument\b", "DOC_STUB", inner_js)
         transformed_node = re.sub(r"^(var|const|let|j)\s*q\s*=", "window.q = ", transformed_node, flags=re.MULTILINE)
         transformed_node += "\ntry { console.log(window.q); } catch(e) { console.log('Variable q not found'); }"
 
@@ -159,16 +135,15 @@ class AnimePahe:
             tf.write(transformed_node)
             tf.flush()
 
-        proc = await asyncio.create_subprocess_exec(
-            node_bin, tmp_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_exec(node_bin, tmp_path,
+                                                    stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.PIPE)
         stdout_data, stderr_data = await proc.communicate()
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
+
         out = ""
         if stdout_data:
             out += stdout_data.decode(errors="ignore")
@@ -177,6 +152,8 @@ class AnimePahe:
         m = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", out)
         if m:
             return m.group(0)
+
+        # fallback using execjs
         try:
             js_code = (
                 "var window = { location: {} };"
@@ -192,10 +169,11 @@ class AnimePahe:
                 return js_m3u8
         except Exception:
             pass
+
         m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
         if m_html:
             return m_html.group(1)
-        raise Exception(f"Could not resolve to .m3u8. Node output (first 2000 chars):\n{out[:2000]}")
+        raise Exception(f"Could not resolve .m3u8. Node output (first 2000 chars):\n{out[:2000]}")
 
 # -------------------- FastAPI --------------------
 app = FastAPI()
