@@ -89,23 +89,42 @@ class AnimePahe:
         url = f"{self.base}/play/{anime_session}/{episode_session}"
         html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
 
-        # Extract all data-src URLs
-        matches = re.findall(r'data-src="([^"]+)"', html)
+        # Extract all buttons from the resolution dropdown (quality info)
+        buttons = re.findall(
+            r'<button[^>]+data-src="([^"]+)"[^>]+data-fansub="([^"]+)"[^>]+data-resolution="([^"]+)"[^>]+data-audio="([^"]+)"[^>]*>',
+            html
+        )
 
-        # Filter only kwik links (supporting future mirror domains)
-        kwik_links = [m for m in matches if re.match(r"https:\/\/kwik\.(si|cx|link)\/e\/", m)]
+        sources = []
+        for src, fansub, resolution, audio in buttons:
+            if src.startswith("https://kwik."):
+                sources.append({
+                    "url": src,
+                    "quality": f"{resolution}p",
+                    "fansub": fansub,
+                    "audio": audio
+                })
 
-        # Fallback (in case not found via data-src)
-        if not kwik_links:
+        # Fallback if structured dropdown not found
+        if not sources:
             kwik_links = re.findall(r"https:\/\/kwik\.(si|cx|link)\/e\/\w+", html)
+            sources = [{"url": link, "quality": None, "fansub": None, "audio": None} for link in kwik_links]
 
-        # Remove duplicates while keeping order
-        unique_kwik = list(dict.fromkeys(kwik_links))
+        # Deduplicate
+        unique_sources = list({s["url"]: s for s in sources}.values())
 
-        if not unique_kwik:
+        # Optional: sort by resolution descending
+        def sort_key(s):
+            try:
+                return int(s["quality"].replace("p", "")) if s["quality"] else 0
+            except Exception:
+                return 0
+        unique_sources.sort(key=sort_key, reverse=True)
+
+        if not unique_sources:
             raise Exception("No kwik links found on play page")
 
-        return unique_kwik
+        return unique_sources
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
         html = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20).text)
