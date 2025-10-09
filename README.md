@@ -22,8 +22,8 @@ This project provides an **async Python FastAPI backend** to search for anime, f
 1. **Clone the repository:**
 
 ```bash
-git clone https://github.com/pal-droid/animepahe-api-scraper.git
-cd animepahe-api-scraper
+git clone https://github.com/pal-droid/Animepahe-api.git
+cd Animepahe-api
 ```
 
 2. **Install dependencies:**
