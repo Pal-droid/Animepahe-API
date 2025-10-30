@@ -9,7 +9,6 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 import cloudscraper
-import subprocess
 
 # -------------------- Utility --------------------
 def random_user_agent():
@@ -22,6 +21,7 @@ def random_user_agent():
         "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
     ]
     return random.choice(agents)
+
 
 # -------------------- AnimePahe Class --------------------
 class AnimePahe:
@@ -123,24 +123,39 @@ class AnimePahe:
         return unique_sources
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
-        # --- Print raw HTTP response from Kwik ---
+        """ Added: debug print of Kwik HTML """
         resp = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20))
-        print("\n" + "="*60)
-        print(f"[DEBUG] Kwik HTTP {resp.status_code} {kwik_url}")
-        print("="*60)
-        print(resp.text[:5000])  # print first 5000 chars
-        print("="*60 + "\n")
+        print(f"\n[DEBUG] Kwik HTTP {resp.status_code}: {kwik_url}")
+        print("="*80)
+        print(resp.text[:2000])  # print first 2000 chars
+        print("="*80 + "\n")
+
+        # optional: save HTML to a temp file for inspection
+        with open("kwik_debug.html", "w", encoding="utf-8") as f:
+            f.write(resp.text)
 
         html = resp.text
-
         m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
         if m3u8_direct:
             return m3u8_direct.group(0)
 
         scripts = re.findall(r"(<script[^>]*>[\s\S]*?</script>)", html, re.IGNORECASE)
-        script_block = next((s for s in scripts if "eval(" in s), None)
+        script_block, largest_eval_script, max_len = None, None, 0
+        for s in scripts:
+            if "eval(" in s:
+                if "Plyr" in s or ".m3u8" in s or "source" in s or "uwu" in s:
+                    script_block = s
+                    break
+                if len(s) > max_len:
+                    max_len = len(s)
+                    largest_eval_script = s
         if not script_block:
-            raise Exception("No <script> block with eval() found")
+            script_block = largest_eval_script
+        if not script_block:
+            m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
+            if m_html:
+                return m_html.group(1)
+            raise Exception("No candidate <script> block found to evaluate")
 
         inner_js = re.sub(r"^<script[^>]*>", "", script_block, flags=re.IGNORECASE).strip()
         inner_js = re.sub(r"</script>$", "", inner_js, flags=re.IGNORECASE).strip()
@@ -148,67 +163,82 @@ class AnimePahe:
         wrapper = r"""
 globalThis.window = { location: {} };
 globalThis.document = { cookie: '' };
-globalThis.navigator = { userAgent: 'Mozilla/5.0' };
+globalThis.navigator = { userAgent: 'mozilla' };
 const __captured = [];
 const origLog = console.log;
-console.log = (...args) => { __captured.push(args.join(' ')); origLog(...args); };
+console.log = (...args)=>{__captured.push(args.join(' '));origLog(...args);};
 (function(){
-  const origEval = globalThis.eval;
-  globalThis.eval = (x)=>{ __captured.push('[EVAL]' + x); return origEval(x); };
+  const origEval = eval;
+  eval = (x)=>{__captured.push('[EVAL]' + x);return origEval(x);};
 })();
 """
-
         final_js = wrapper + "\n" + inner_js + "\n" + (
             "setTimeout(()=>{for(const c of __captured){console.log('__CAPTURED__START__');"
             "console.log(c);console.log('__CAPTURED__END__');}process.exit(0)},300);"
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
-            tf.write(final_js)
             tmp_path = tf.name
+            tf.write(final_js)
+            tf.flush()
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 node_bin, tmp_path,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            out, err = await proc.communicate()
-            output = out.decode() + err.decode()
+            stdout, stderr = await proc.communicate()
         finally:
             os.unlink(tmp_path)
 
-        matches = re.findall(r"https?://[^'\"\s<>]+\.m3u8", output)
-        if matches:
-            return matches[0]
-        raise Exception("Failed to extract m3u8 from Node output")
+        out = (stdout.decode(errors="ignore") + stderr.decode(errors="ignore"))
+        m = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", out)
+        if m:
+            return m.group(0)
+
+        m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
+        if m_html:
+            return m_html.group(1)
+        raise Exception(f"Could not resolve .m3u8. Node output:\n{out[:2000]}")
 
 
-# -------------------- FastAPI App --------------------
+# -------------------- FastAPI --------------------
 app = FastAPI()
 pahe = AnimePahe()
 
+
 @app.get("/search")
-async def search(q: str):
-    return await pahe.search(q)
-
-@app.get("/episodes/{session}")
-async def episodes(session: str):
-    return await pahe.get_episodes(session)
-
-@app.get("/sources/{anime_session}/{episode_session}")
-async def sources(anime_session: str, episode_session: str):
-    return await pahe.get_sources(anime_session, episode_session)
-
-@app.get("/resolve_kwik")
-async def resolve_kwik(url: str):
+async def api_search(q: str):
     try:
-        link = await pahe.resolve_kwik_with_node(url)
-        return JSONResponse(content={"stream": link})
+        results = await pahe.search(q)
+        return JSONResponse(content=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------- Run --------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+
+@app.get("/episodes")
+async def api_episodes(session: str):
+    try:
+        eps = await pahe.get_episodes(session)
+        return JSONResponse(content=eps)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sources")
+async def api_sources(anime_session: str, episode_session: str):
+    try:
+        srcs = await pahe.get_sources(anime_session, episode_session)
+        return JSONResponse(content=srcs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/m3u8")
+async def api_resolve_kwik(url: str):
+    try:
+        m3u8 = await pahe.resolve_kwik_with_node(url)
+        return JSONResponse(content={"m3u8": m3u8})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
