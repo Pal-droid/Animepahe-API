@@ -127,16 +127,22 @@ class AnimePahe:
         return unique_sources
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
+        """
+        Resolve a kwik URL by executing its packed JS in Node with an eval/Function interceptor
+        to capture any unpacked source that contains the final .m3u8 link.
+        """
         html = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20).text)
+        # quick direct search
         m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
         if m3u8_direct:
             return m3u8_direct.group(0)
 
+        # find candidate <script> blocks
         scripts = re.findall(r"(<script[^>]*>[\s\S]*?</script>)", html, re.IGNORECASE)
         script_block, largest_eval_script, max_len = None, None, 0
         for s in scripts:
             if "eval(" in s:
-                if "source" in s or ".m3u8" in s or "Plyr" in s:
+                if "Plyr" in s or ".m3u8" in s or "source" in s or "uwu" in s:
                     script_block = s
                     break
                 if len(s) > max_len:
@@ -150,40 +156,103 @@ class AnimePahe:
                 return m_html.group(1)
             raise Exception("No candidate <script> block found to evaluate")
 
+        # extract inner JS
         inner_js = re.sub(r"^<script[^>]*>", "", script_block, flags=re.IGNORECASE).strip()
         inner_js = re.sub(r"</script>$", "", inner_js, flags=re.IGNORECASE).strip()
-        transformed_node = re.sub(r"\bdocument\b", "DOC_STUB", inner_js)
-        transformed_node = re.sub(r"^(var|const|let|j)\s*q\s*=", "window.q = ", transformed_node, flags=re.MULTILINE)
-        transformed_node += "\ntry { console.log(window.q); } catch(e) { console.log('Variable q not found'); }"
 
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding='utf-8') as tf:
+        # Build Node wrapper that intercepts eval() and Function() calls and captures their arguments/bodies
+        wrapper = r"""
+globalThis.window = { location: {} };
+globalThis.document = { cookie: '' };
+globalThis.navigator = { userAgent: 'mozilla' };
+
+const __captured = [];
+const origLog = console.log;
+console.log = function(...args){
+  try { __captured.push(args.map(a=>String(a)).join(' ')); } catch(e){}
+  origLog.apply(console,args);
+};
+
+// intercept eval and Function to capture unpacked code or eval args
+(function(){
+  try {
+    const origEval = globalThis.eval;
+    globalThis.eval = function(x){
+      try { __captured.push('[__EVAL_ARG__] ' + String(x)); } catch(e){}
+      return origEval(x);
+    };
+  } catch(e) {}
+
+  try {
+    const OrigFunction = globalThis.Function;
+    globalThis.Function = function(...args){
+      const body = args.length ? args[args.length-1] : '';
+      try { __captured.push('[__FUNCTION_BODY__] ' + String(body)); } catch(e){}
+      return OrigFunction.apply(this, args);
+    };
+  } catch(e) {}
+})();
+"""
+
+        # final runner will append inner_js and then print captured blocks
+        final_js = wrapper + "\n\n" + inner_js + "\n\n" + (
+            "setTimeout(()=>{ "
+            "for(const c of __captured){ console.log('__CAPTURED__START__'); console.log(c); console.log('__CAPTURED__END__'); } "
+            "try{ process.exit(0) } catch(e){} }, 150);"
+        )
+
+        # write to temp file
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tf:
             tmp_path = tf.name
-            tf.write("globalThis.window = { location: {} };\n")
-            tf.write("globalThis.document = { cookie: '' };\n")
-            tf.write("const DOC_STUB = globalThis.document;\n")
-            tf.write("globalThis.navigator = { userAgent: 'mozilla' };\n")
-            tf.write(transformed_node)
+            tf.write(final_js)
             tf.flush()
 
-        proc = await asyncio.create_subprocess_exec(node_bin, tmp_path,
-                                                    stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.PIPE)
-        stdout_data, stderr_data = await proc.communicate()
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
         out = ""
-        if stdout_data:
-            out += stdout_data.decode(errors="ignore")
-        if stderr_data:
-            out += "\n[stderr]\n" + stderr_data.decode(errors="ignore")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                node_bin, tmp_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                # keep a modest timeout so badly-behaved scripts can't hang forever
+                stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=6.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise Exception("Node execution timed out")
+
+            if stdout_data:
+                out += stdout_data.decode(errors="ignore")
+            if stderr_data:
+                out += "\n[stderr]\n" + stderr_data.decode(errors="ignore")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+        # 1) direct search in node output (stdout/stderr)
         m = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", out)
         if m:
             return m.group(0)
 
-        # fallback using execjs
+        # 2) search inside captured blocks printed by our wrapper
+        captured_blocks = re.findall(r"__CAPTURED__START__\s*\n([\s\S]*?)\n__CAPTURED__END__", out)
+        for block in captured_blocks:
+            m2 = re.search(r"https?://[^'\"\s]+\.m3u8[^\s'\"\)]*", block)
+            if m2:
+                return m2.group(0)
+            # sometimes the unpacked code contains a variable assignment or a string with the url; search for .m3u8 inside text
+            if ".m3u8" in block:
+                # try to pull surrounding URL-like token
+                m3 = re.search(r"https?://[^\s'\"\\)]+?\.m3u8[^\s'\"\\)]*", block)
+                if m3:
+                    return m3.group(0)
+
+        # 3) fallback: maybe inner code writes to window.q or similar, try execjs fallback like before
         try:
             js_code = (
                 "var window = { location: {} };"
@@ -200,11 +269,13 @@ class AnimePahe:
         except Exception:
             pass
 
+        # 4) final fallback: look for data-src attributes in original HTML
         m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
         if m_html:
             return m_html.group(1)
-        raise Exception(f"Could not resolve .m3u8. Node output (first 2000 chars):\n{out[:2000]}")
 
+        # nothing found
+        raise Exception(f"Could not resolve .m3u8. Node output (first 2000 chars):\n{out[:2000]}")
 
 # -------------------- FastAPI --------------------
 app = FastAPI()
