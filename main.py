@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-import cloudscraper
+import tls_client
 
 # -------------------- Utility --------------------
 def random_user_agent():
@@ -29,14 +29,33 @@ class AnimePahe:
         self.base = "https://animepahe.si"
         self.headers = {
             "User-Agent": random_user_agent(),
-            "Cookie": "__ddg1_=;__ddg2_=",
             "Referer": "https://animepahe.si/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "DNT": "1",
+            "Connection": "keep-alive",
         }
-        self.scraper = cloudscraper.create_scraper()
+        # Replace cloudscraper with tls-client (emulates Chrome fingerprint)
+        self.session = tls_client.Session(client_identifier="chrome_120")
+
+    # Helper functions
+    async def fetch_text(self, url: str, headers: Optional[dict] = None, timeout: int = 20) -> str:
+        h = self.headers.copy()
+        if headers:
+            h.update(headers)
+        response = await asyncio.to_thread(lambda: self.session.get(url, headers=h, timeout=timeout))
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code} for {url}")
+        return response.text
+
+    async def fetch_json(self, url: str, headers: Optional[dict] = None, timeout: int = 20):
+        text = await self.fetch_text(url, headers, timeout)
+        import json
+        return json.loads(text)
 
     async def search(self, query: str):
         url = f"{self.base}/api?m=search&q={query}"
-        html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
+        html = await self.fetch_text(url)
         data = execjs.eval(f"JSON.parse(`{html}`)") if isinstance(html, str) else html
         results = []
         for a in data.get("data", []):
@@ -52,23 +71,23 @@ class AnimePahe:
         return results
 
     async def get_episodes(self, anime_session: str):
-        html = await asyncio.to_thread(lambda: self.scraper.get(f"{self.base}/anime/{anime_session}", headers=self.headers).text)
+        html = await self.fetch_text(f"{self.base}/anime/{anime_session}")
         soup = BeautifulSoup(html, "html.parser")
         meta = soup.find("meta", {"property": "og:url"})
         if not meta:
             raise Exception("Could not find session ID in meta tag")
         temp_id = meta["content"].split("/")[-1]
 
-        first_page_json = await asyncio.to_thread(
-            lambda: self.scraper.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1", headers=self.headers).json()
+        first_page_json = await self.fetch_json(
+            f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1"
         )
         episodes = first_page_json.get("data", [])
         last_page = first_page_json.get("last_page", 1)
 
         async def fetch_page(p):
-            return await asyncio.to_thread(
-                lambda: self.scraper.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}", headers=self.headers).json().get("data", [])
-            )
+            return await self.fetch_json(
+                f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}"
+            ).get("data", [])
 
         tasks = [fetch_page(p) for p in range(2, last_page + 1)]
         for pages in await asyncio.gather(*tasks):
@@ -87,7 +106,7 @@ class AnimePahe:
 
     async def get_sources(self, anime_session: str, episode_session: str):
         url = f"{self.base}/play/{anime_session}/{episode_session}"
-        html = await asyncio.to_thread(lambda: self.scraper.get(url, headers=self.headers).text)
+        html = await self.fetch_text(url)
 
         buttons = re.findall(
             r'<button[^>]+data-src="([^"]+)"[^>]+data-fansub="([^"]+)"[^>]+data-resolution="([^"]+)"[^>]+data-audio="([^"]+)"[^>]*>',
@@ -123,18 +142,13 @@ class AnimePahe:
         return unique_sources
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
-        """ Added: debug print of Kwik HTML """
-        resp = await asyncio.to_thread(lambda: self.scraper.get(kwik_url, headers=self.headers, timeout=20))
-        print(f"\n[DEBUG] Kwik HTTP {resp.status_code}: {kwik_url}")
-        print("="*80)
-        print(resp.text[:2000])  # print first 2000 chars
+        """ Debug print of Kwik HTML """
+        resp_text = await self.fetch_text(kwik_url)
+        print(f"\n[DEBUG] Kwik: {kwik_url}\n{'='*80}")
+        print(resp_text[:2000])
         print("="*80 + "\n")
 
-        # optional: save HTML to a temp file for inspection
-        with open("kwik_debug.html", "w", encoding="utf-8") as f:
-            f.write(resp.text)
-
-        html = resp.text
+        html = resp_text
         m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
         if m3u8_direct:
             return m3u8_direct.group(0)
