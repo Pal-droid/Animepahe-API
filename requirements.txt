@@ -1,5 +1,5 @@
 # HTTP client
-cloudscraper
+tls-client
 
 # Run JS 
 PyExecJS
