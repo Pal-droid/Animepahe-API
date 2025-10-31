@@ -1,5 +1,7 @@
 # AnimePahe API Scraper
 
+### CURRENTLY DOES NOT WORK, IM TRYING TO FIND A FIX
+
 🚀 **Been trying to find an actually working AnimePahe API that can bypass Cloudflare? Well, this repo has got your back!**  
 
 This project provides an **async Python FastAPI backend** to search for anime, fetch episodes, and resolve streaming sources (including `.m3u8` links) from [AnimePahe](https://animepahe.si). It uses `cloudscraper` to bypass Cloudflare IUAM protection and optionally `Node.js` or `PyExecJS` to evaluate obfuscated JavaScript when needed.
