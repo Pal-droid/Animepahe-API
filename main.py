@@ -30,33 +30,20 @@ class AnimePahe:
         self.headers = {
             "User-Agent": random_user_agent(),
             "Referer": "https://animepahe.si/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "DNT": "1",
-            "Connection": "keep-alive",
         }
-        # Replace cloudscraper with tls-client (emulates Chrome fingerprint)
         self.session = tls_client.Session(client_identifier="chrome_120")
 
-    # Helper functions
-    async def fetch_text(self, url: str, headers: Optional[dict] = None, timeout: int = 20) -> str:
-        h = self.headers.copy()
-        if headers:
-            h.update(headers)
-        response = await asyncio.to_thread(lambda: self.session.get(url, headers=h, timeout=timeout))
-        if response.status_code != 200:
-            raise Exception(f"HTTP {response.status_code} for {url}")
-        return response.text
-
-    async def fetch_json(self, url: str, headers: Optional[dict] = None, timeout: int = 20):
-        text = await self.fetch_text(url, headers, timeout)
-        import json
-        return json.loads(text)
+    async def get(self, url: str):
+        """Run tls-client GET asynchronously"""
+        def _req():
+            r = self.session.get(url, headers=self.headers)
+            return r
+        return await asyncio.to_thread(_req)
 
     async def search(self, query: str):
         url = f"{self.base}/api?m=search&q={query}"
-        html = await self.fetch_text(url)
-        data = execjs.eval(f"JSON.parse(`{html}`)") if isinstance(html, str) else html
+        r = await self.get(url)
+        data = r.json()
         results = []
         for a in data.get("data", []):
             results.append({
@@ -71,23 +58,19 @@ class AnimePahe:
         return results
 
     async def get_episodes(self, anime_session: str):
-        html = await self.fetch_text(f"{self.base}/anime/{anime_session}")
+        html = (await self.get(f"{self.base}/anime/{anime_session}")).text
         soup = BeautifulSoup(html, "html.parser")
         meta = soup.find("meta", {"property": "og:url"})
         if not meta:
             raise Exception("Could not find session ID in meta tag")
         temp_id = meta["content"].split("/")[-1]
 
-        first_page_json = await self.fetch_json(
-            f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1"
-        )
+        first_page_json = (await self.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page=1")).json()
         episodes = first_page_json.get("data", [])
         last_page = first_page_json.get("last_page", 1)
 
         async def fetch_page(p):
-            return await self.fetch_json(
-                f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}"
-            ).get("data", [])
+            return (await self.get(f"{self.base}/api?m=release&id={temp_id}&sort=episode_asc&page={p}")).json().get("data", [])
 
         tasks = [fetch_page(p) for p in range(2, last_page + 1)]
         for pages in await asyncio.gather(*tasks):
@@ -105,8 +88,7 @@ class AnimePahe:
         ]
 
     async def get_sources(self, anime_session: str, episode_session: str):
-        url = f"{self.base}/play/{anime_session}/{episode_session}"
-        html = await self.fetch_text(url)
+        html = (await self.get(f"{self.base}/play/{anime_session}/{episode_session}")).text
 
         buttons = re.findall(
             r'<button[^>]+data-src="([^"]+)"[^>]+data-fansub="([^"]+)"[^>]+data-resolution="([^"]+)"[^>]+data-audio="([^"]+)"[^>]*>',
@@ -142,13 +124,14 @@ class AnimePahe:
         return unique_sources
 
     async def resolve_kwik_with_node(self, kwik_url: str, node_bin: str = "node") -> str:
-        """ Debug print of Kwik HTML """
-        resp_text = await self.fetch_text(kwik_url)
-        print(f"\n[DEBUG] Kwik: {kwik_url}\n{'='*80}")
-        print(resp_text[:2000])
+        """Use tls-client and Node.js to extract .m3u8"""
+        resp = await self.get(kwik_url)
+        print(f"\n[DEBUG] Kwik HTTP {resp.status_code}: {kwik_url}")
+        print("="*80)
+        print(resp.text[:2000])
         print("="*80 + "\n")
 
-        html = resp_text
+        html = resp.text
         m3u8_direct = re.search(r"https?://[^'\"\s<>]+\.m3u8", html)
         if m3u8_direct:
             return m3u8_direct.group(0)
@@ -166,10 +149,7 @@ class AnimePahe:
         if not script_block:
             script_block = largest_eval_script
         if not script_block:
-            m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
-            if m_html:
-                return m_html.group(1)
-            raise Exception("No candidate <script> block found to evaluate")
+            raise Exception("No candidate <script> block found")
 
         inner_js = re.sub(r"^<script[^>]*>", "", script_block, flags=re.IGNORECASE).strip()
         inner_js = re.sub(r"</script>$", "", inner_js, flags=re.IGNORECASE).strip()
@@ -211,10 +191,7 @@ console.log = (...args)=>{__captured.push(args.join(' '));origLog(...args);};
         if m:
             return m.group(0)
 
-        m_html = re.search(r'data-src="([^"]+\.m3u8[^"]*)"', html)
-        if m_html:
-            return m_html.group(1)
-        raise Exception(f"Could not resolve .m3u8. Node output:\n{out[:2000]}")
+        raise Exception(f"Could not resolve .m3u8. Node output:\n{out[:1000]}")
 
 
 # -------------------- FastAPI --------------------
@@ -225,8 +202,7 @@ pahe = AnimePahe()
 @app.get("/search")
 async def api_search(q: str):
     try:
-        results = await pahe.search(q)
-        return JSONResponse(content=results)
+        return await pahe.search(q)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -234,8 +210,7 @@ async def api_search(q: str):
 @app.get("/episodes")
 async def api_episodes(session: str):
     try:
-        eps = await pahe.get_episodes(session)
-        return JSONResponse(content=eps)
+        return await pahe.get_episodes(session)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -243,8 +218,7 @@ async def api_episodes(session: str):
 @app.get("/sources")
 async def api_sources(anime_session: str, episode_session: str):
     try:
-        srcs = await pahe.get_sources(anime_session, episode_session)
-        return JSONResponse(content=srcs)
+        return await pahe.get_sources(anime_session, episode_session)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -253,6 +227,6 @@ async def api_sources(anime_session: str, episode_session: str):
 async def api_resolve_kwik(url: str):
     try:
         m3u8 = await pahe.resolve_kwik_with_node(url)
-        return JSONResponse(content={"m3u8": m3u8})
+        return {"m3u8": m3u8}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
